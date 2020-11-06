@@ -13,15 +13,58 @@
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <stdbool.h>
-#include <stdint.h>
-#include <string.h>
-#include <unistd.h>
-
+#include "os.h"
 #include "taosmsg.h"
 #include "tschemautil.h"
-#include "ttypes.h"
+#include "ttokendef.h"
+#include "taosdef.h"
 #include "tutil.h"
+#include "tsclient.h"
+
+int32_t tscGetNumOfTags(const STableMeta* pTableMeta) {
+  assert(pTableMeta != NULL);
+  
+  STableComInfo tinfo = tscGetTableInfo(pTableMeta);
+  
+  if (pTableMeta->tableType == TSDB_NORMAL_TABLE) {
+    assert(tinfo.numOfTags == 0);
+    return 0;
+  }
+  
+  if (pTableMeta->tableType == TSDB_SUPER_TABLE || pTableMeta->tableType == TSDB_CHILD_TABLE) {
+    return tinfo.numOfTags;
+  }
+  
+  assert(tinfo.numOfTags == 0);
+  return 0;
+}
+
+int32_t tscGetNumOfColumns(const STableMeta* pTableMeta) {
+  assert(pTableMeta != NULL);
+  
+  // table created according to super table, use data from super table
+  STableComInfo tinfo = tscGetTableInfo(pTableMeta);
+  return tinfo.numOfColumns;
+}
+
+SSchema *tscGetTableSchema(const STableMeta *pTableMeta) {
+  assert(pTableMeta != NULL);
+  return (SSchema*) pTableMeta->schema;
+}
+
+SSchema* tscGetTableTagSchema(const STableMeta* pTableMeta) {
+  assert(pTableMeta != NULL && (pTableMeta->tableType == TSDB_SUPER_TABLE || pTableMeta->tableType == TSDB_CHILD_TABLE));
+  
+  STableComInfo tinfo = tscGetTableInfo(pTableMeta);
+  assert(tinfo.numOfTags > 0);
+  
+  return tscGetTableColumnSchema(pTableMeta, tinfo.numOfColumns);
+}
+
+STableComInfo tscGetTableInfo(const STableMeta* pTableMeta) {
+  assert(pTableMeta != NULL);
+  return pTableMeta->tableInfo;
+}
 
 bool isValidSchema(struct SSchema* pSchema, int32_t numOfCols) {
   if (!VALIDNUMOFCOLS(numOfCols)) {
@@ -55,7 +98,7 @@ bool isValidSchema(struct SSchema* pSchema, int32_t numOfCols) {
 
     // 3. valid column names
     for (int32_t j = i + 1; j < numOfCols; ++j) {
-      if (strncasecmp(pSchema[i].name, pSchema[j].name, TSDB_COL_NAME_LEN) == 0) {
+      if (strncasecmp(pSchema[i].name, pSchema[j].name, sizeof(pSchema[i].name) - 1) == 0) {
         return false;
       }
     }
@@ -67,82 +110,131 @@ bool isValidSchema(struct SSchema* pSchema, int32_t numOfCols) {
   return (rowLen <= TSDB_MAX_BYTES_PER_ROW);
 }
 
-struct SSchema* tsGetSchema(SMeterMeta* pMeta) {
-  if (pMeta == NULL) {
-    return NULL;
-  }
-  return tsGetSchemaColIdx(pMeta, 0);
+SSchema* tscGetTableColumnSchema(const STableMeta* pTableMeta, int32_t colIndex) {
+  assert(pTableMeta != NULL);
+  
+  SSchema* pSchema = (SSchema*) pTableMeta->schema;
+  return &pSchema[colIndex];
 }
 
-struct SSchema* tsGetTagSchema(SMeterMeta* pMeta) {
-  if (pMeta == NULL || pMeta->numOfTags == 0) {
-    return NULL;
+// TODO for large number of columns, employ the binary search method
+SSchema* tscGetTableColumnSchemaById(STableMeta* pTableMeta, int16_t colId) {
+  STableComInfo tinfo = tscGetTableInfo(pTableMeta);
+
+  for(int32_t i = 0; i < tinfo.numOfColumns + tinfo.numOfTags; ++i) {
+    if (pTableMeta->schema[i].colId == colId) {
+      return &pTableMeta->schema[i];
+    }
   }
 
-  return tsGetSchemaColIdx(pMeta, pMeta->numOfColumns);
+  return NULL;
 }
 
-struct SSchema* tsGetSchemaColIdx(SMeterMeta* pMeta, int32_t startCol) {
-  if (pMeta->pSchema == 0) {
-    pMeta->pSchema = sizeof(SMeterMeta);
+struct SSchema tscGetTbnameColumnSchema() {
+  struct SSchema s = {
+      .colId = TSDB_TBNAME_COLUMN_INDEX,
+      .type  = TSDB_DATA_TYPE_BINARY,
+      .bytes = TSDB_TABLE_NAME_LEN
+  };
+  
+  strcpy(s.name, TSQL_TBNAME_L);
+  return s;
+}
+static void tscInitCorVgroupInfo(SCMCorVgroupInfo *corVgroupInfo, SCMVgroupInfo *vgroupInfo) {
+  corVgroupInfo->version = 0;
+  corVgroupInfo->inUse = 0;
+  corVgroupInfo->numOfEps = vgroupInfo->numOfEps;
+  for (int32_t i = 0; i < corVgroupInfo->numOfEps; i++) {
+    corVgroupInfo->epAddr[i].fqdn = strdup(vgroupInfo->epAddr[i].fqdn);
+    corVgroupInfo->epAddr[i].port = vgroupInfo->epAddr[i].port;
   }
-
-  return (SSchema*)(((char*)pMeta + pMeta->pSchema) + startCol * sizeof(SSchema));
 }
 
-char* tsGetTagsValue(SMeterMeta* pMeta) {
-  if (pMeta->tags == 0) {
-    int32_t numOfTotalCols = pMeta->numOfColumns + pMeta->numOfTags;
-    pMeta->tags = sizeof(SMeterMeta) + numOfTotalCols * sizeof(SSchema);
+STableMeta* tscCreateTableMetaFromMsg(STableMetaMsg* pTableMetaMsg, size_t* size) {
+  assert(pTableMetaMsg != NULL);
+  
+  int32_t schemaSize = (pTableMetaMsg->numOfColumns + pTableMetaMsg->numOfTags) * sizeof(SSchema);
+  STableMeta* pTableMeta = calloc(1, sizeof(STableMeta) + schemaSize);
+  pTableMeta->tableType = pTableMetaMsg->tableType;
+  
+  pTableMeta->tableInfo = (STableComInfo) {
+    .numOfTags    = pTableMetaMsg->numOfTags,
+    .precision    = pTableMetaMsg->precision,
+    .numOfColumns = pTableMetaMsg->numOfColumns,
+  };
+  
+  pTableMeta->id.tid = pTableMetaMsg->tid;
+  pTableMeta->id.uid = pTableMetaMsg->uid;
+
+  SCMVgroupInfo* pVgroupInfo = &pTableMeta->vgroupInfo;
+  pVgroupInfo->numOfEps = pTableMetaMsg->vgroup.numOfEps;
+  pVgroupInfo->vgId = pTableMetaMsg->vgroup.vgId;
+
+  for(int32_t i = 0; i < pVgroupInfo->numOfEps; ++i) {
+    SEpAddrMsg* pEpMsg = &pTableMetaMsg->vgroup.epAddr[i];
+
+    pVgroupInfo->epAddr[i].fqdn = strndup(pEpMsg->fqdn, tListLen(pEpMsg->fqdn));
+    pVgroupInfo->epAddr[i].port = pEpMsg->port;
   }
 
-  return ((char*)pMeta + pMeta->tags);
+  tscInitCorVgroupInfo(&pTableMeta->corVgroupInfo, &pTableMeta->vgroupInfo);
+
+  pTableMeta->sversion = pTableMetaMsg->sversion;
+  pTableMeta->tversion = pTableMetaMsg->tversion;
+  tstrncpy(pTableMeta->sTableId, pTableMetaMsg->sTableId, TSDB_TABLE_FNAME_LEN);
+  
+  memcpy(pTableMeta->schema, pTableMetaMsg->schema, schemaSize);
+  
+  int32_t numOfTotalCols = pTableMeta->tableInfo.numOfColumns;
+  for(int32_t i = 0; i < numOfTotalCols; ++i) {
+    pTableMeta->tableInfo.rowSize += pTableMeta->schema[i].bytes;
+  }
+  
+  if (size != NULL) {
+    *size = sizeof(STableMeta) + schemaSize;
+  }
+  
+  return pTableMeta;
 }
 
-bool tsMeterMetaIdentical(SMeterMeta* p1, SMeterMeta* p2) {
-  if (p1 == NULL || p2 == NULL || p1->uid != p2->uid || p1->sversion != p2->sversion) {
-    return false;
-  }
+/**
+ * the TableMeta data format in memory is as follows:
+ *
+ * +--------------------+
+ * |STableMeta Body data|  sizeof(STableMeta)
+ * +--------------------+
+ * |Schema data         |  numOfTotalColumns * sizeof(SSchema)
+ * +--------------------+
+ * |Tags data           |  tag_col_1.bytes + tag_col_2.bytes + ....
+ * +--------------------+
+ *
+ * @param pTableMeta
+ * @return
+ */
+char* tsGetTagsValue(STableMeta* pTableMeta) {
+  int32_t offset = 0;
+//  int32_t  numOfTotalCols = pTableMeta->numOfColumns + pTableMeta->numOfTags;
+//  uint32_t offset = sizeof(STableMeta) + numOfTotalCols * sizeof(SSchema);
 
-  if (p1 == p2) {
-    return true;
-  }
-
-  size_t size = sizeof(SMeterMeta) + p1->numOfColumns * sizeof(SSchema);
-
-  for (int32_t i = 0; i < p1->numOfTags; ++i) {
-    SSchema* pColSchema = tsGetSchemaColIdx(p1, i + p1->numOfColumns);
-    size += pColSchema->bytes;
-  }
-
-  return memcmp(p1, p2, size) == 0;
+  return ((char*)pTableMeta + offset);
 }
 
-static FORCE_INLINE char* skipSegments(char* input, char delimiter, int32_t num) {
+// todo refactor
+UNUSED_FUNC static FORCE_INLINE char* skipSegments(char* input, char delim, int32_t num) {
   for (int32_t i = 0; i < num; ++i) {
-    while (*input != 0 && *input++ != delimiter) {
+    while (*input != 0 && *input++ != delim) {
     };
   }
   return input;
 }
 
-static FORCE_INLINE void copySegment(char* dst, char* src, char delimiter) {
+UNUSED_FUNC static FORCE_INLINE size_t copy(char* dst, const char* src, char delimiter) {
+  size_t len = 0;
   while (*src != delimiter && *src != 0) {
     *dst++ = *src++;
+    len++;
   }
+  
+  return len;
 }
 
-/**
- * extract meter name from meterid, which the format of userid.dbname.metername
- * @param meterId
- * @return
- */
-void extractMeterName(char* meterId, char* name) {
-  char* r = skipSegments(meterId, TS_PATH_DELIMITER[0], 2);
-  copySegment(name, r, TS_PATH_DELIMITER[0]);
-}
-
-void extractDBName(char* meterId, char* name) {
-  char* r = skipSegments(meterId, TS_PATH_DELIMITER[0], 1);
-  copySegment(name, r, TS_PATH_DELIMITER[0]);
-}

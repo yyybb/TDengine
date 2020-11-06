@@ -18,8 +18,8 @@ import java.io.InputStream;
 import java.io.Reader;
 import java.math.BigDecimal;
 import java.net.URL;
-import java.sql.*;
 import java.sql.Date;
+import java.sql.*;
 import java.util.*;
 
 /*
@@ -67,14 +67,23 @@ public class DatabaseMetaDataResultSet implements ResultSet {
 
     @Override
     public boolean next() throws SQLException {
+//        boolean ret = false;
+//        if (rowDataList.size() > 0) {
+//            ret = rowDataList.iterator().hasNext();
+//            if (ret) {
+//                rowCursor = rowDataList.iterator().next();
+//                cursorRowNumber++;
+//            }
+//        }
+//        return ret;
+
+        /**** add by zyyang 2020-09-29 ****************/
         boolean ret = false;
-        if (rowDataList.size() > 0) {
-            ret = rowDataList.iterator().hasNext();
-            if (ret) {
-                rowCursor = rowDataList.iterator().next();
-                cursorRowNumber++;
-            }
+        if (!rowDataList.isEmpty() && cursorRowNumber < rowDataList.size()) {
+            rowCursor = rowDataList.get(cursorRowNumber++);
+            ret = true;
         }
+
         return ret;
     }
 
@@ -91,7 +100,8 @@ public class DatabaseMetaDataResultSet implements ResultSet {
     @Override
     public String getString(int columnIndex) throws SQLException {
         columnIndex--;
-        return rowCursor.getString(columnIndex, columnMetaDataList.get(columnIndex).getColType());
+        int colType = columnMetaDataList.get(columnIndex).getColType();
+        return rowCursor.getString(columnIndex, colType);
     }
 
     @Override
@@ -102,41 +112,49 @@ public class DatabaseMetaDataResultSet implements ResultSet {
 
     @Override
     public byte getByte(int columnIndex) throws SQLException {
+        columnIndex--;
         return (byte) rowCursor.getInt(columnIndex, columnMetaDataList.get(columnIndex).getColType());
     }
 
     @Override
     public short getShort(int columnIndex) throws SQLException {
+        columnIndex--;
         return (short) rowCursor.getInt(columnIndex, columnMetaDataList.get(columnIndex).getColType());
     }
 
     @Override
     public int getInt(int columnIndex) throws SQLException {
+        columnIndex--;
         return rowCursor.getInt(columnIndex, columnMetaDataList.get(columnIndex).getColType());
     }
 
     @Override
     public long getLong(int columnIndex) throws SQLException {
+        columnIndex--;
         return rowCursor.getLong(columnIndex, columnMetaDataList.get(columnIndex).getColType());
     }
 
     @Override
     public float getFloat(int columnIndex) throws SQLException {
+        columnIndex--;
         return rowCursor.getFloat(columnIndex, columnMetaDataList.get(columnIndex).getColType());
     }
 
     @Override
     public double getDouble(int columnIndex) throws SQLException {
+        columnIndex--;
         return rowCursor.getDouble(columnIndex, columnMetaDataList.get(columnIndex).getColType());
     }
 
     @Override
     public BigDecimal getBigDecimal(int columnIndex, int scale) throws SQLException {
+        columnIndex--;
         return new BigDecimal(rowCursor.getDouble(columnIndex, columnMetaDataList.get(columnIndex).getColType()));
     }
 
     @Override
     public byte[] getBytes(int columnIndex) throws SQLException {
+        columnIndex--;
         return (rowCursor.getString(columnIndex, columnMetaDataList.get(columnIndex).getColType())).getBytes();
     }
 
@@ -152,6 +170,7 @@ public class DatabaseMetaDataResultSet implements ResultSet {
 
     @Override
     public Timestamp getTimestamp(int columnIndex) throws SQLException {
+        columnIndex--;
         return rowCursor.getTimestamp(columnIndex);
     }
 
